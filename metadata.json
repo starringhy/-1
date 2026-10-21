@@ -1,0 +1,6 @@
+{
+  "name": "지구마불세계여행 종합 탐구 전광판",
+  "description": "초등 사회 수업 갤러리 워크를 위한 14개 모둠 국가 탐구 일반화 문장 종합 전광판 및 발표 웹 애플리케이션",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
