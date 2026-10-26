@@ -4,8 +4,9 @@
  */
 
 // 기본 연결된 구글 Apps Script 웹 앱 URL (?sheet=... 파라미터가 있으면 자동 갱신됨)
+// 주의: 이곳에는 github.io 주소가 아니라 반드시 https://script.google.com/macros/s/.../exec 주소를 넣어야 합니다!
 const DEFAULT_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxZFWzLRNzCMAOhAHqlBYt04lKpJ35a4_LCLbgWAHqDLomzolOa_MdBD8PR91oGuR7yHQ/exec';
-const DEFAULT_APPS_SCRIPT_URL = 'https://starringhy.github.io/-1/'; 
+
 const STORAGE_KEY_TEAMS = 'earth_marble_teams_v1';
 const STORAGE_KEY_SCRIPT_URL = 'earth_marble_apps_script_url';
 const DEFAULT_TEAMS_COUNT = 14;
@@ -13,15 +14,26 @@ const IS_STATIC_HOST =
   window.location.hostname.endsWith('.github.io') ||
   window.location.protocol === 'file:';
 
-// 1-Click Copy Google Apps Script Template (supports CORS JSON + JSONP + Atomic Row Lock)
+// 1-Click Copy Google Apps Script Template (supports 1-click 초기세팅실행 + CORS JSON + JSONP + Atomic Row Lock)
 const APPS_SCRIPT_TEMPLATE = `const SHEET_NAME = '지구마불탐구';
 const TEAM_COUNT = 14;
+
+// [1단계] 붙여넣기 후 상단 [▷ 실행] 버튼을 한 번 누르면 시트에 1~14모둠 표가 자동 생성됩니다!
+function 초기세팅실행() {
+  getOrInitSheet();
+}
 
 function getOrInitSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
-    sheet = ss.insertSheet(SHEET_NAME);
+    const firstSheet = ss.getSheets()[0];
+    if (firstSheet && firstSheet.getLastRow() === 0) {
+      firstSheet.setName(SHEET_NAME);
+      sheet = firstSheet;
+    } else {
+      sheet = ss.insertSheet(SHEET_NAME);
+    }
   }
   if (sheet.getLastRow() < TEAM_COUNT + 1) {
     sheet.clear();
@@ -30,6 +42,12 @@ function getOrInitSheet() {
       rows.push([i, i + '모둠', '', '', '']);
     }
     sheet.getRange(1, 1, rows.length, 5).setValues(rows);
+    sheet.getRange(1, 1, 1, 5).setBackground('#e3f2fd').setFontWeight('bold');
+    sheet.setColumnWidth(1, 70);
+    sheet.setColumnWidth(2, 90);
+    sheet.setColumnWidth(3, 150);
+    sheet.setColumnWidth(4, 480);
+    sheet.setColumnWidth(5, 180);
   }
   return sheet;
 }
@@ -109,7 +127,7 @@ function doGet(e) {
   }
   return ContentService
     .createTextOutput(json)
-    .setMimeType(ContentService.MimeType.JSON);
+      .setMimeType(ContentService.MimeType.JSON);
 }
 
 function doPost(e) {
@@ -147,7 +165,14 @@ const DEFAULT_ROLES = [
 ];
 
 function getActiveScriptUrl() {
-  return (localStorage.getItem(STORAGE_KEY_SCRIPT_URL) || DEFAULT_APPS_SCRIPT_URL || '').trim();
+  const saved = (localStorage.getItem(STORAGE_KEY_SCRIPT_URL) || '').trim();
+  if (saved.startsWith('https://script.google.com/')) {
+    return saved;
+  }
+  if (DEFAULT_APPS_SCRIPT_URL.startsWith('https://script.google.com/')) {
+    return DEFAULT_APPS_SCRIPT_URL.trim();
+  }
+  return '';
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
