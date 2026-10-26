@@ -947,8 +947,32 @@ body.mode-teacher .board-view-container {
   padding: 12px 14px;
   font-size: 0.88rem;
   color: #3b5998;
+  line-height: 1.55;
+  margin-bottom: 14px;
+}
+
+.sheet-diag-box {
+  display: none;
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 0.88rem;
   line-height: 1.5;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
+  font-weight: 500;
+}
+
+.sheet-diag-box.error {
+  display: block;
+  background: #fff3f3;
+  border: 1.5px solid #ffb8b8;
+  color: #c0392b;
+}
+
+.sheet-diag-box.ok {
+  display: block;
+  background: #eafaf1;
+  border: 1.5px solid #a9dfbf;
+  color: #1e8449;
 }
 
 .sheet-backup-row {

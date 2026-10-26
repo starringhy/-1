@@ -319,6 +319,114 @@ async function startServer() {
     res.json({ ok: true, appsScriptUrl: store.appsScriptUrl });
   });
 
+  // Server-side proxy for Google Apps Script to avoid iframe CORS errors and diagnose deployment permissions
+  app.get('/api/sheet-proxy', async (req: Request, res: Response) => {
+    const targetUrl = sanitizeString(req.query.url ?? store.appsScriptUrl, 500);
+    if (!targetUrl || !targetUrl.startsWith('https://script.google.com/')) {
+      res.json({ ok: false, errorCode: 'INVALID_URL', message: '유효한 Apps Script 웹 앱 URL이 아닙니다.' });
+      return;
+    }
+
+    try {
+      const firstHop = await fetch(targetUrl, { method: 'GET', redirect: 'manual' });
+      const location = firstHop.headers.get('location') || '';
+
+      if (location.includes('accounts.google.com')) {
+        res.json({
+          ok: false,
+          errorCode: 'AUTH_REQUIRED',
+          message: '현재 Apps Script 배포의 액세스 권한이 로그인이 필요한 상태입니다. Apps Script > [배포] > [배포 관리] > 수정(✏️)에서 액세스 권한을 반드시 맨 아래 [모든 사용자(Anyone)]로 변경 후 [새 버전]으로 배포해 주세요.',
+        });
+        return;
+      }
+
+      const finalRes = location
+        ? await fetch(location, { method: 'GET', redirect: 'follow' })
+        : firstHop;
+
+      const text = await finalRes.text();
+      if (text.trim().startsWith('<')) {
+        res.json({
+          ok: false,
+          errorCode: 'HTML_RESPONSE',
+          message: 'Apps Script가 JSON 대신 웹페이지를 반환했습니다. 코드에 doGet 함수가 저장되었는지, 배포 시 [새 버전]을 선택했는지 확인해 주세요.',
+        });
+        return;
+      }
+
+      const parsed = JSON.parse(text) as unknown;
+      const teams = Array.isArray(parsed)
+        ? parsed
+        : parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).teams)
+        ? (parsed as Record<string, unknown>).teams
+        : null;
+
+      if (teams) {
+        store.teams = normalizeTeams(teams);
+        await saveStoreToDisk();
+      }
+
+      res.json({ ok: true, teams: store.teams });
+    } catch (err) {
+      res.json({
+        ok: false,
+        errorCode: 'NETWORK_ERROR',
+        message: err instanceof Error ? err.message : '시트 서버 연결 중 오류가 발생했습니다.',
+      });
+    }
+  });
+
+  app.post('/api/sheet-proxy', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { url?: unknown; payload?: unknown };
+    const targetUrl = sanitizeString(body.url ?? store.appsScriptUrl, 500);
+    if (!targetUrl || !targetUrl.startsWith('https://script.google.com/')) {
+      res.json({ ok: false, errorCode: 'INVALID_URL', message: '유효한 Apps Script URL이 아닙니다.' });
+      return;
+    }
+
+    try {
+      const firstHop = await fetch(targetUrl, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(body.payload ?? {}),
+      });
+
+      const location = firstHop.headers.get('location') || '';
+      if (location.includes('accounts.google.com')) {
+        res.json({
+          ok: false,
+          errorCode: 'AUTH_REQUIRED',
+          message: 'Apps Script 배포의 액세스 권한을 [모든 사용자(Anyone)]로 변경해 주세요.',
+        });
+        return;
+      }
+
+      if (location) {
+        const followRes = await fetch(location, { method: 'GET', redirect: 'follow' });
+        const text = await followRes.text();
+        try {
+          const parsed = JSON.parse(text) as { teams?: unknown };
+          if (Array.isArray(parsed.teams)) {
+            store.teams = normalizeTeams(parsed.teams);
+            await saveStoreToDisk();
+            broadcast({ type: 'teams:synced', teams: store.teams, updatedAt: store.updatedAt });
+          }
+        } catch {
+          // Ignore non-JSON body if write succeeded
+        }
+      }
+
+      res.json({ ok: true, teams: store.teams });
+    } catch (err) {
+      res.json({
+        ok: false,
+        errorCode: 'NETWORK_ERROR',
+        message: err instanceof Error ? err.message : '시트 저장 중 오류가 발생했습니다.',
+      });
+    }
+  });
+
   // =========================================================================
   // Frontend Static / Vite Middleware
   // =========================================================================

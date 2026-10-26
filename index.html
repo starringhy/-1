@@ -205,12 +205,14 @@
       </p>
 
       <div class="dialog-hint-box">
-        <strong>⚡ 1분 연동 방법:</strong><br>
-        1) 새 구글 스프레드시트 열기 → 상단 메뉴 <strong>[확장 프로그램] &gt; [Apps Script]</strong> 클릭<br>
-        2) 아래 <strong>[📋 Apps Script 코드 복사]</strong> 버튼을 눌러 기존 코드를 지우고 붙여넣기 후 저장(💾)<br>
-        3) 우측 상단 <strong>[배포] &gt; [새 배포]</strong> → 유형: <strong>웹 앱</strong>, 액세스 권한: <strong>모든 사용자(Anyone)</strong> 선택 후 배포<br>
-        4) 발급된 <strong>웹 앱 URL</strong>을 아래 칸에 붙여넣고 저장한 뒤, 상단 <strong>[🔗 공유 링크 복사]</strong>로 학생들에게 링크 배포!
+        <strong>⚡ 1분 연동 방법 (필수 체크!):</strong><br>
+        1) 구글 스프레드시트 상단 <strong>[확장 프로그램] &gt; [Apps Script]</strong> 열기<br>
+        2) 아래 <strong>[📋 Apps Script 코드 복사하기]</strong>를 눌러 붙여넣고 저장(💾)<br>
+        3) 우측 상단 <strong>[배포] &gt; [새 배포]</strong> (기존 배포 수정 시 <strong>[배포 관리] &gt; ✏️ 수정 &gt; 버전: [새 버전]</strong>)<br>
+        4) 액세스 권한: <strong>⚠️ [Google 계정이 있는 모든 사용자]가 아닌 맨 아래 [모든 사용자(Anyone)]</strong> 선택 후 배포!
       </div>
+
+      <div id="sheetDiagBox" class="sheet-diag-box"></div>
 
       <div class="sheet-backup-row">
         <button type="button" class="btn-action btn-share-link sheet-backup-btn" onclick="copyAppsScriptCode()">
