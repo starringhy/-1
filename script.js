@@ -1,22 +1,124 @@
 /**
  * 지구마불세계여행 프로젝트 - 최종 차시 실시간 탐구 종합 전광판
- * 다중 사용자 실시간 서버 동기화 (Express REST + WebSocket + Google Apps Script 호환)
+ * 다중 사용자 실시간 동기화 (Google Apps Script 클라우드 시트 + Express/WebSocket 이중 지원)
  */
+
+// [선택] GitHub Pages 배포 시 아래 따옴표 안에 배포된 구글 Apps Script 웹 앱 URL을 넣어두면
+// URL 파라미터 없이도 접속하는 모든 기기가 자동으로 해당 구글 시트와 실시간 동기화됩니다.
+const DEFAULT_APPS_SCRIPT_URL = '';
 
 const STORAGE_KEY_TEAMS = 'earth_marble_teams_v1';
 const STORAGE_KEY_SCRIPT_URL = 'earth_marble_apps_script_url';
 const DEFAULT_TEAMS_COUNT = 14;
 
+// Google Apps Script Template (Copied via 1-click button in modal)
+const APPS_SCRIPT_TEMPLATE = `const SHEET_NAME = '지구마불탐구';
+const TEAM_COUNT = 14;
+
+function getOrInitSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+  }
+  if (sheet.getLastRow() < TEAM_COUNT + 1) {
+    sheet.clear();
+    const rows = [['모둠ID', '모둠번호', '탐구나라', '일반화된문장', '수정시각']];
+    for (let i = 1; i <= TEAM_COUNT; i++) {
+      rows.push([i, i + '모둠', '', '', '']);
+    }
+    sheet.getRange(1, 1, rows.length, 5).setValues(rows);
+  }
+  return sheet;
+}
+
+function readAllTeams(sheet) {
+  const values = sheet.getRange(2, 1, TEAM_COUNT, 5).getValues();
+  return values.map((row, idx) => ({
+    id: Number(row[0]) || (idx + 1),
+    teamNumber: String(row[1] || ((idx + 1) + '모둠')),
+    countryName: String(row[2] || ''),
+    sentence: String(row[3] || ''),
+    updatedAt: row[4] ? String(row[4]) : null
+  }));
+}
+
+function doGet() {
+  const sheet = getOrInitSheet();
+  const teams = readAllTeams(sheet);
+  return ContentService
+    .createTextOutput(JSON.stringify({ ok: true, teams: teams }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sheet = getOrInitSheet();
+    const payload = JSON.parse(e.postData.contents || '{}');
+    const now = new Date().toISOString();
+
+    if (payload.action === 'updateTeam' && payload.team) {
+      const id = Number(payload.team.id);
+      if (id >= 1 && id <= TEAM_COUNT) {
+        sheet.getRange(id + 1, 3, 1, 3).setValues([[
+          String(payload.team.countryName || ''),
+          String(payload.team.sentence || ''),
+          now
+        ]]);
+      }
+    } else if (payload.action === 'clearTeam' && payload.teamId) {
+      const id = Number(payload.teamId);
+      if (id >= 1 && id <= TEAM_COUNT) {
+        sheet.getRange(id + 1, 3, 1, 3).setValues([['', '', '']]);
+      }
+    } else if (payload.action === 'batchCountries' && payload.countries) {
+      for (let i = 1; i <= TEAM_COUNT; i++) {
+        const key = String(i);
+        if (Object.prototype.hasOwnProperty.call(payload.countries, key)) {
+          sheet.getRange(i + 1, 3).setValue(String(payload.countries[key] || ''));
+          sheet.getRange(i + 1, 5).setValue(now);
+        }
+      }
+    } else if (payload.action === 'resetAll') {
+      const blank = [];
+      for (let i = 1; i <= TEAM_COUNT; i++) blank.push(['', '', '']);
+      sheet.getRange(2, 3, TEAM_COUNT, 3).setValues(blank);
+    } else if (Array.isArray(payload.teams)) {
+      const rows = [];
+      for (let i = 1; i <= TEAM_COUNT; i++) {
+        const found = payload.teams.find(t => Number(t.id) === i) || payload.teams[i - 1] || {};
+        rows.push([
+          i,
+          i + '모둠',
+          String(found.countryName || ''),
+          String(found.sentence || ''),
+          found.updatedAt || now
+        ]);
+      }
+      sheet.getRange(2, 1, TEAM_COUNT, 5).setValues(rows);
+    }
+
+    const teams = readAllTeams(sheet);
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: true, teams: teams }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}`;
+
 // State
 let teamsData = [];
-let currentViewMode = 'input'; // 'input' | 'teacher'
+let currentViewMode = 'input';
 let activeZoomTeamId = null;
 let serverAvailable = false;
 let wsConnection = null;
 let wsReconnectTimer = null;
-let pendingConfirmCallback = null;
+let isFetchingRemote = false;
 
-// Per-card local typing debounce timers & dirty flags so remote updates never break Korean IME typing
+// Per-card local typing debounce timers & dirty flags so remote updates never interrupt Korean IME typing
 const autoSaveTimers = new Map();
 const dirtyTeamIds = new Set();
 
@@ -27,6 +129,10 @@ const DEFAULT_ROLES = [
   { id: 'organizer', title: '🌟 정리대장 (자료 및 모둠 정리)', cardClass: 'role-card-organizer' }
 ];
 
+function getActiveScriptUrl() {
+  return (localStorage.getItem(STORAGE_KEY_SCRIPT_URL) || DEFAULT_APPS_SCRIPT_URL || '').trim();
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   applyUrlParameters();
   initLocalFallbackData();
@@ -35,21 +141,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateStats();
   setupEventListeners();
 
-  // Connect to shared server immediately so all users with the link see the same data
   await fetchLatestFromServer(false);
   connectWebSocket();
   startBackgroundSyncLoop();
 });
 
-/**
- * Check URL parameters (?mode=teacher or ?sheet=...)
- */
 function applyUrlParameters() {
   try {
     const params = new URLSearchParams(window.location.search);
     const sheetParam = params.get('sheet');
     if (sheetParam && sheetParam.startsWith('https://script.google.com/')) {
-      localStorage.setItem(STORAGE_KEY_SCRIPT_URL, sheetParam);
+      localStorage.setItem(STORAGE_KEY_SCRIPT_URL, sheetParam.trim());
     }
     const modeParam = params.get('mode');
     if (modeParam === 'teacher') {
@@ -60,9 +162,6 @@ function applyUrlParameters() {
   }
 }
 
-/**
- * Initialize default 14 teams locally while awaiting server response
- */
 function initLocalFallbackData() {
   const saved = localStorage.getItem(STORAGE_KEY_TEAMS);
   if (saved) {
@@ -97,19 +196,31 @@ function saveToLocalStorage() {
   try {
     localStorage.setItem(STORAGE_KEY_TEAMS, JSON.stringify(teamsData));
   } catch {
-    // Ignore storage quota issues in private browsing
+    // Ignore storage quota issues
   }
   updateStats();
 }
 
 /**
  * =========================================================================
- * Real-Time Shared Backend Synchronization (/api/teams + WebSocket /ws)
+ * Real-Time Shared Synchronization (Google Sheets Cloud + Express/WS)
  * =========================================================================
  */
 
 async function fetchLatestFromServer(showFeedback) {
+  if (isFetchingRemote) return;
+  isFetchingRemote = true;
+
   try {
+    const scriptUrl = getActiveScriptUrl();
+
+    // Priority 1: If Google Apps Script URL is configured, sync across ALL accounts/hosts (AI Studio + GitHub Pages)
+    if (scriptUrl) {
+      const ok = await silentFetchFromAppsScript(scriptUrl, showFeedback);
+      if (ok) return;
+    }
+
+    // Priority 2: Built-in Express shared API (/api/teams)
     const res = await fetch('/api/teams', {
       method: 'GET',
       headers: { 'Accept': 'application/json' },
@@ -120,8 +231,10 @@ async function fetchLatestFromServer(showFeedback) {
     const payload = await res.json();
     serverAvailable = true;
 
-    if (payload.appsScriptUrl && !localStorage.getItem(STORAGE_KEY_SCRIPT_URL)) {
+    if (payload.appsScriptUrl && !getActiveScriptUrl()) {
       localStorage.setItem(STORAGE_KEY_SCRIPT_URL, payload.appsScriptUrl);
+      await silentFetchFromAppsScript(payload.appsScriptUrl, showFeedback);
+      return;
     }
 
     if (Array.isArray(payload.teams)) {
@@ -132,13 +245,62 @@ async function fetchLatestFromServer(showFeedback) {
       showToast('🔄 모든 모둠의 최신 공유 내용을 동기화했습니다!');
     }
   } catch {
-    // Fallback for static GitHub Pages if /api/teams does not exist: try Google Apps Script if configured
-    const scriptUrl = localStorage.getItem(STORAGE_KEY_SCRIPT_URL);
-    if (scriptUrl) {
-      await silentFetchFromAppsScript(scriptUrl, showFeedback);
-    } else if (showFeedback) {
-      showToast('현재 로컬 모드로 동작 중입니다.');
+    if (showFeedback) {
+      showToast('구글 시트 연동 전이거나 오프라인 상태입니다. 상단 [🔄 시트 불러오기]에서 URL을 설정해 주세요.');
     }
+  } finally {
+    isFetchingRemote = false;
+  }
+}
+
+async function silentFetchFromAppsScript(scriptUrl, showFeedback) {
+  try {
+    const separator = scriptUrl.includes('?') ? '&' : '?';
+    const res = await fetch(`${scriptUrl}${separator}t=${Date.now()}`, {
+      method: 'GET',
+      redirect: 'follow'
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    const list = Array.isArray(data) ? data : (Array.isArray(data?.teams) ? data.teams : null);
+    if (list) {
+      applyRemoteTeamsList(list);
+      if (showFeedback) {
+        showToast('🔄 구글 스프레드시트에서 전체 모둠 최신 내용을 동기화했습니다!');
+      }
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function postToAppsScript(payload) {
+  const scriptUrl = getActiveScriptUrl();
+  if (!scriptUrl) return false;
+  try {
+    const res = await fetch(scriptUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    if (res.ok) {
+      try {
+        const data = await res.json();
+        if (Array.isArray(data?.teams)) {
+          applyRemoteTeamsList(data.teams);
+        }
+      } catch {
+        // Ignore non-JSON response from custom Apps Script
+      }
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn('Apps Script POST warning:', err);
+    return false;
   }
 }
 
@@ -161,6 +323,15 @@ function connectWebSocket() {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        if (data.type === 'config:updated' && typeof data.appsScriptUrl === 'string') {
+          localStorage.setItem(STORAGE_KEY_SCRIPT_URL, data.appsScriptUrl);
+          fetchLatestFromServer(false);
+          return;
+        }
+
+        // If Google Sheet is active, Sheet is the global source of truth; skip local container WS override
+        if (getActiveScriptUrl()) return;
+
         if (data.type === 'init' && Array.isArray(data.teams)) {
           if (data.appsScriptUrl) {
             localStorage.setItem(STORAGE_KEY_SCRIPT_URL, data.appsScriptUrl);
@@ -170,8 +341,6 @@ function connectWebSocket() {
           applyRemoteSingleTeam(data.team);
         } else if (data.type === 'teams:synced' && Array.isArray(data.teams)) {
           applyRemoteTeamsList(data.teams);
-        } else if (data.type === 'config:updated' && typeof data.appsScriptUrl === 'string') {
-          localStorage.setItem(STORAGE_KEY_SCRIPT_URL, data.appsScriptUrl);
         }
       } catch (err) {
         console.warn('WS message parse error:', err);
@@ -180,7 +349,7 @@ function connectWebSocket() {
 
     ws.onclose = () => {
       wsConnection = null;
-      wsReconnectTimer = setTimeout(connectWebSocket, 3000);
+      wsReconnectTimer = setTimeout(connectWebSocket, 3500);
     };
 
     ws.onerror = () => {
@@ -191,16 +360,12 @@ function connectWebSocket() {
   }
 }
 
-/**
- * Periodic background sync guarantees 100% consistency across accounts/tabs
- * even when school network proxies buffer or block WebSockets.
- */
 function startBackgroundSyncLoop() {
   setInterval(() => {
     if (document.visibilityState === 'visible') {
       fetchLatestFromServer(false);
     }
-  }, 2500);
+  }, 3000);
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
@@ -213,9 +378,6 @@ function startBackgroundSyncLoop() {
   });
 }
 
-/**
- * Check if the current user is actively typing inside a given team's card
- */
 function isUserActivelyEditingTeam(teamId) {
   if (dirtyTeamIds.has(teamId)) return true;
   const active = document.activeElement;
@@ -223,17 +385,10 @@ function isUserActivelyEditingTeam(teamId) {
   return active.id === `country-${teamId}` || active.id === `sentence-${teamId}`;
 }
 
-/**
- * Apply remote update for a single team without disturbing other cards being typed in
- */
 function applyRemoteSingleTeam(remoteTeam) {
   const id = Number(remoteTeam.id);
   const localTeam = teamsData.find(t => t.id === id);
-  if (!localTeam) return;
-
-  if (isUserActivelyEditingTeam(id)) {
-    return;
-  }
+  if (!localTeam || isUserActivelyEditingTeam(id)) return;
 
   const changed =
     localTeam.countryName !== (remoteTeam.countryName || '') ||
@@ -254,26 +409,19 @@ function applyRemoteSingleTeam(remoteTeam) {
   }
 }
 
-/**
- * Apply full 14-team list from server while preserving any card currently being typed by this user
- */
 function applyRemoteTeamsList(remoteTeams) {
   let anyBoardChange = false;
 
   for (let i = 0; i < DEFAULT_TEAMS_COUNT; i++) {
     const id = i + 1;
     const remote = remoteTeams.find(r => Number(r.id) === id) || remoteTeams[i];
-    if (!remote) continue;
-
-    if (isUserActivelyEditingTeam(id)) {
-      continue;
-    }
+    if (!remote || isUserActivelyEditingTeam(id)) continue;
 
     const local = teamsData.find(t => t.id === id);
     if (!local) continue;
 
-    const newCountry = remote.countryName || '';
-    const newSentence = remote.sentence || '';
+    const newCountry = String(remote.countryName || '');
+    const newSentence = String(remote.sentence || '');
 
     if (local.countryName !== newCountry || local.sentence !== newSentence) {
       local.countryName = newCountry;
@@ -297,7 +445,7 @@ function applyRemoteTeamsList(remoteTeams) {
 }
 
 /**
- * Push a single team's changes to the shared server (and Google Apps Script if configured)
+ * Push a single team's changes to shared Google Sheet AND local server
  */
 async function pushSingleTeamToServer(teamId, showSuccessToast) {
   const team = teamsData.find(t => t.id === teamId);
@@ -312,6 +460,20 @@ async function pushSingleTeamToServer(teamId, showSuccessToast) {
 
   let syncedRemotely = false;
 
+  // 1) Sync to Google Apps Script if configured (works across all accounts, AI Studio, and GitHub Pages!)
+  if (getActiveScriptUrl()) {
+    const sheetOk = await postToAppsScript({
+      action: 'updateTeam',
+      project: '지구마불세계여행',
+      savedAt: new Date().toISOString(),
+      team: team,
+      updatedTeam: team,
+      teams: teamsData
+    });
+    if (sheetOk) syncedRemotely = true;
+  }
+
+  // 2) Sync to Express server (/api/teams/:id)
   try {
     const res = await fetch(`/api/teams/${teamId}`, {
       method: 'PUT',
@@ -331,27 +493,7 @@ async function pushSingleTeamToServer(teamId, showSuccessToast) {
       syncedRemotely = true;
     }
   } catch {
-    // Ignore if running on pure static host
-  }
-
-  // Also sync to Google Apps Script if teacher configured a URL
-  const scriptUrl = localStorage.getItem(STORAGE_KEY_SCRIPT_URL);
-  if (scriptUrl) {
-    try {
-      await fetch(scriptUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          project: '지구마불세계여행',
-          savedAt: new Date().toISOString(),
-          updatedTeam: team,
-          teams: teamsData
-        })
-      });
-      syncedRemotely = true;
-    } catch (err) {
-      console.warn('Apps Script auto-sync warning:', err);
-    }
+    // Ignore on pure static host
   }
 
   dirtyTeamIds.delete(teamId);
@@ -379,7 +521,7 @@ function scheduleAutoSave(teamId) {
   const timer = setTimeout(() => {
     autoSaveTimers.delete(teamId);
     pushSingleTeamToServer(teamId, false);
-  }, 650);
+  }, 700);
 
   autoSaveTimers.set(teamId, timer);
 }
@@ -503,7 +645,6 @@ function setCardStatusUI(teamId, state) {
     return;
   }
 
-  // 'saved'
   const isCompleted = team.sentence.trim().length > 0;
   const hasCountry = team.countryName.trim().length > 0;
   if (statusTag) {
@@ -524,9 +665,6 @@ function setCardStatusUI(teamId, state) {
   }
 }
 
-/**
- * Render Teacher Billboard Mode Cards
- */
 function renderTeacherBoardGrid() {
   const container = document.getElementById('boardGrid');
   if (!container) return;
@@ -654,14 +792,12 @@ function openConfirmModal(title, message, confirmBtnText, onConfirm) {
     };
   }
 
-  pendingConfirmCallback = onConfirm;
   if (modal) modal.classList.add('open');
 }
 
 function closeConfirmModal() {
   const modal = document.getElementById('confirmModal');
   if (modal) modal.classList.remove('open');
-  pendingConfirmCallback = null;
 }
 
 function confirmClearTeam(id) {
@@ -683,6 +819,7 @@ function confirmClearTeam(id) {
       team.sentence = '';
       team.updatedAt = null;
 
+      await postToAppsScript({ action: 'clearTeam', teamId: id });
       try {
         await fetch(`/api/teams/${id}`, { method: 'DELETE' });
       } catch {
@@ -712,6 +849,7 @@ function resetAllTeams() {
 
       teamsData = generateDefaultTeams();
 
+      await postToAppsScript({ action: 'resetAll' });
       try {
         await fetch('/api/teams', {
           method: 'PUT',
@@ -729,9 +867,6 @@ function resetAllTeams() {
   );
 }
 
-/**
- * Update Top Stats Counter
- */
 function updateStats() {
   const completedCount = teamsData.filter(t => t.sentence.trim().length > 0).length;
   const countEl = document.getElementById('completedCount');
@@ -740,11 +875,7 @@ function updateStats() {
   }
 }
 
-/**
- * Switch between "Student Input Mode" and "Teacher Billboard Mode"
- */
 function setViewMode(mode, silent) {
-  // Flush any pending unsaved edits before switching to Teacher Billboard!
   if (mode === 'teacher' && dirtyTeamIds.size > 0) {
     Array.from(dirtyTeamIds).forEach(teamId => {
       pushSingleTeamToServer(teamId, false);
@@ -787,7 +918,8 @@ function setViewMode(mode, silent) {
 }
 
 /**
- * Copy Shareable Classroom Link (converts ais-dev preview hostname to ais-pre shared URL automatically)
+ * Copy Shareable Classroom Link
+ * Always embeds ?sheet=... when Google Apps Script URL is set so all accounts connect to the same Sheet!
  */
 async function copyShareLink() {
   let shareOrigin = window.location.origin;
@@ -796,23 +928,34 @@ async function copyShareLink() {
   }
 
   let shareUrl = `${shareOrigin}${window.location.pathname}`;
-  const scriptUrl = localStorage.getItem(STORAGE_KEY_SCRIPT_URL);
-  if (!serverAvailable && scriptUrl) {
+  const scriptUrl = getActiveScriptUrl();
+  if (scriptUrl) {
     shareUrl += `?sheet=${encodeURIComponent(scriptUrl)}`;
   }
 
+  await copyTextToClipboard(shareUrl);
+  if (scriptUrl) {
+    showToast('🔗 구글 시트 실시간 연동이 포함된 학생 공유 링크가 복사되었습니다!');
+  } else {
+    showToast('🔗 공유 링크가 복사되었습니다! (타 계정 동기화를 위해 구글 시트 URL 연결을 권장합니다)');
+  }
+}
+
+async function copyAppsScriptCode() {
+  await copyTextToClipboard(APPS_SCRIPT_TEMPLATE);
+  showToast('📋 구글 Apps Script 코드가 복사되었습니다! 시트의 Apps Script 편집기에 그대로 붙여넣어 주세요.');
+}
+
+async function copyTextToClipboard(text) {
   try {
-    await navigator.clipboard.writeText(shareUrl);
-    showToast('🔗 학생 공유용 링크가 클립보드에 복사되었습니다! (타 계정에서도 바로 접속 가능)');
+    await navigator.clipboard.writeText(text);
   } catch {
-    // Fallback copy method for iframes
-    const tempInput = document.createElement('input');
-    tempInput.value = shareUrl;
-    document.body.appendChild(tempInput);
-    tempInput.select();
+    const tempArea = document.createElement('textarea');
+    tempArea.value = text;
+    document.body.appendChild(tempArea);
+    tempArea.select();
     document.execCommand('copy');
-    tempInput.remove();
-    showToast('🔗 학생 공유용 링크가 복사되었습니다!');
+    tempArea.remove();
   }
 }
 
@@ -932,6 +1075,11 @@ async function saveBatchNames() {
     }
   });
 
+  await postToAppsScript({
+    action: 'batchCountries',
+    countries: countriesMap
+  });
+
   try {
     const res = await fetch('/api/teams', {
       method: 'PUT',
@@ -941,7 +1089,7 @@ async function saveBatchNames() {
         countries: countriesMap
       })
     });
-    if (res.ok) {
+    if (res.ok && !getActiveScriptUrl()) {
       const data = await res.json();
       if (Array.isArray(data.teams)) {
         teamsData = data.teams;
@@ -1012,16 +1160,16 @@ function openSheetModal(actionType) {
   const urlInput = document.getElementById('sheetUrlInput');
   const actionBtn = document.getElementById('btnExecuteSheetAction');
 
-  const savedUrl = localStorage.getItem(STORAGE_KEY_SCRIPT_URL) || '';
+  const savedUrl = getActiveScriptUrl();
   if (urlInput) urlInput.value = savedUrl;
 
   if (actionType === 'load') {
-    title.textContent = '🔄 구글 스프레드시트에서 불러오기';
-    actionBtn.textContent = '시트에서 지금 불러오기';
+    title.textContent = '🔄 구글 스프레드시트 실시간 연동 / 불러오기';
+    actionBtn.textContent = 'URL 저장 및 시트에서 불러오기';
     actionBtn.onclick = () => executeSheetLoad();
   } else {
-    title.textContent = '💾 구글 스프레드시트에 결과 저장';
-    actionBtn.textContent = '시트에 지금 저장하기';
+    title.textContent = '💾 구글 스프레드시트 실시간 연동 / 저장';
+    actionBtn.textContent = 'URL 저장 및 시트에 전체 저장';
     actionBtn.onclick = () => executeSheetSave();
   }
 
@@ -1047,29 +1195,11 @@ async function saveSheetUrlToSharedConfig() {
   return url;
 }
 
-async function silentFetchFromAppsScript(scriptUrl, showFeedback) {
-  try {
-    const res = await fetch(scriptUrl);
-    if (!res.ok) return;
-    const data = await res.json();
-    const list = Array.isArray(data) ? data : (Array.isArray(data?.teams) ? data.teams : null);
-    if (list) {
-      applyRemoteTeamsList(list);
-      if (showFeedback) {
-        showToast('🔄 구글 시트에서 최신 내용을 불러왔습니다!');
-      }
-    }
-  } catch {
-    // Silent fallback
-  }
-}
-
 async function executeSheetLoad() {
   const scriptUrl = await saveSheetUrlToSharedConfig();
 
   if (!scriptUrl) {
-    await fetchLatestFromServer(true);
-    closeSheetModal();
+    showToast('먼저 Apps Script 웹 앱 배포 URL을 입력해 주세요!');
     return;
   }
 
@@ -1079,24 +1209,24 @@ async function executeSheetLoad() {
   actionBtn.textContent = '불러오는 중... ⏳';
 
   try {
-    const res = await fetch(scriptUrl);
+    const separator = scriptUrl.includes('?') ? '&' : '?';
+    const res = await fetch(`${scriptUrl}${separator}t=${Date.now()}`, { redirect: 'follow' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw = await res.json();
     const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.teams) ? raw.teams : null);
 
     if (list && list.length > 0) {
-      const normalized = teamsData.map((def, idx) => {
+      teamsData = teamsData.map((def, idx) => {
         const item = list.find(r => Number(r.id) === def.id) || list[idx] || {};
         return {
           id: def.id,
           teamNumber: def.teamNumber,
-          countryName: item.countryName || '',
-          sentence: item.sentence || '',
+          countryName: String(item.countryName || ''),
+          sentence: String(item.sentence || ''),
           updatedAt: item.updatedAt || new Date().toISOString()
         };
       });
 
-      teamsData = normalized;
       try {
         await fetch('/api/teams', {
           method: 'PUT',
@@ -1110,13 +1240,14 @@ async function executeSheetLoad() {
       saveToLocalStorage();
       renderApp();
       closeSheetModal();
-      showToast('🎉 구글 스프레드시트 데이터를 불러와 전체 전광판에 반영했습니다!');
+      showToast('🎉 구글 시트 연동 완료! 이제 상단 [🔗 공유 링크 복사]로 학생들에게 링크를 보내세요.');
     } else {
-      showToast('시트에 불러올 모둠 데이터가 없습니다.');
+      showToast('시트 연결 성공! (현재 시트가 비어 있습니다)');
+      closeSheetModal();
     }
   } catch (err) {
     console.error(err);
-    showToast('시트 불러오기 실패: Apps Script 배포 URL과 권한(모든 사용자)을 확인해 주세요.');
+    showToast('시트 연결 실패: 배포 시 액세스 권한을 [모든 사용자(Anyone)]로 설정했는지 확인해 주세요.');
   } finally {
     actionBtn.disabled = false;
     actionBtn.textContent = origText;
@@ -1127,7 +1258,7 @@ async function executeSheetSave() {
   const scriptUrl = await saveSheetUrlToSharedConfig();
 
   if (!scriptUrl) {
-    showToast('Apps Script URL을 입력하시거나 [결과 파일 다운로드]를 이용해 주세요.');
+    showToast('먼저 Apps Script 웹 앱 배포 URL을 입력해 주세요!');
     return;
   }
 
@@ -1137,22 +1268,19 @@ async function executeSheetSave() {
   actionBtn.textContent = '저장하는 중... ⏳';
 
   try {
-    const res = await fetch(scriptUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        project: '지구마불세계여행',
-        savedAt: new Date().toISOString(),
-        teams: teamsData
-      })
+    const ok = await postToAppsScript({
+      action: 'replaceAll',
+      project: '지구마불세계여행',
+      savedAt: new Date().toISOString(),
+      teams: teamsData
     });
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!ok) throw new Error('Sheet POST failed');
     closeSheetModal();
-    showToast('🎉 구글 스프레드시트에 전체 모둠 결과가 저장되었습니다!');
+    showToast('🎉 구글 스프레드시트에 14개 모둠 전체 결과가 저장되었습니다!');
   } catch (err) {
     console.error(err);
-    showToast('시트 저장 실패: Apps Script 배포 설정을 확인해 주세요.');
+    showToast('시트 저장 실패: Apps Script 배포 권한([모든 사용자])을 확인해 주세요.');
   } finally {
     actionBtn.disabled = false;
     actionBtn.textContent = origText;
@@ -1188,12 +1316,13 @@ function importDataFromJson() {
             return {
               id: def.id,
               teamNumber: def.teamNumber,
-              countryName: item.countryName || '',
-              sentence: item.sentence || '',
+              countryName: String(item.countryName || ''),
+              sentence: String(item.sentence || ''),
               updatedAt: item.updatedAt || new Date().toISOString()
             };
           });
 
+          await postToAppsScript({ action: 'replaceAll', teams: teamsData });
           try {
             await fetch('/api/teams', {
               method: 'PUT',
@@ -1243,6 +1372,7 @@ async function fillSampleData() {
     }
   });
 
+  await postToAppsScript({ action: 'replaceAll', teams: teamsData });
   try {
     await fetch('/api/teams', {
       method: 'PUT',
@@ -1258,9 +1388,6 @@ async function fillSampleData() {
   showToast('✨ 시연용 샘플 데이터가 전체 전광판에 반영되었습니다!');
 }
 
-/**
- * Keyboard shortcuts
- */
 function setupEventListeners() {
   document.addEventListener('keydown', (e) => {
     const zoomModal = document.getElementById('zoomModal');
@@ -1287,9 +1414,6 @@ function setupEventListeners() {
   });
 }
 
-/**
- * Toast Notification Helper
- */
 let toastTimeout = null;
 function showToast(message) {
   const toast = document.getElementById('toastMsg');
@@ -1302,12 +1426,9 @@ function showToast(message) {
   if (toastTimeout) clearTimeout(toastTimeout);
   toastTimeout = setTimeout(() => {
     toast.classList.remove('show');
-  }, 2800);
+  }, 3200);
 }
 
-/**
- * Safe HTML string escape helper
- */
 function escapeHtml(str) {
   if (!str) return '';
   return String(str)
