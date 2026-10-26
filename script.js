@@ -4,7 +4,7 @@
  */
 
 // 기본 연결된 구글 Apps Script 웹 앱 URL (?sheet=... 파라미터가 있으면 자동 갱신됨)
-// 주의: 이곳에는 github.io 주소가 아니라 반드시 https://script.google.com/macros/s/.../exec 주소를 넣어야 합니다!
+// 주의: 아래 변수는 딱 한 줄만 있어야 합니다! (중복 선언 시 문법 오류로 화면이 멈춥니다)
 const DEFAULT_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxZFWzLRNzCMAOhAHqlBYt04lKpJ35a4_LCLbgWAHqDLomzolOa_MdBD8PR91oGuR7yHQ/exec';
 
 const STORAGE_KEY_TEAMS = 'earth_marble_teams_v1';
@@ -127,7 +127,7 @@ function doGet(e) {
   }
   return ContentService
     .createTextOutput(json)
-      .setMimeType(ContentService.MimeType.JSON);
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 function doPost(e) {
@@ -146,13 +146,48 @@ function doPost(e) {
   }
 }`;
 
-let teamsData = [];
+function generateDefaultTeams() {
+  const list = [];
+  for (let i = 1; i <= DEFAULT_TEAMS_COUNT; i++) {
+    list.push({
+      id: i,
+      teamNumber: `${i}모둠`,
+      countryName: '',
+      sentence: '',
+      updatedAt: null
+    });
+  }
+  return list;
+}
+
+function normalizeTeamsList(raw) {
+  const defaults = generateDefaultTeams();
+  if (!Array.isArray(raw)) return defaults;
+
+  return defaults.map((def, idx) => {
+    const found =
+      raw.find(item => item && typeof item === 'object' && Number(item.id) === def.id) ||
+      raw[idx];
+    if (!found || typeof found !== 'object') return def;
+
+    return {
+      id: def.id,
+      teamNumber: def.teamNumber,
+      countryName: String(found.countryName ?? found.country ?? '').trim(),
+      sentence: String(found.sentence ?? found.generalization ?? found.text ?? '').trim(),
+      updatedAt: found.updatedAt ? String(found.updatedAt) : null
+    };
+  });
+}
+
+let teamsData = generateDefaultTeams();
 let currentViewMode = 'input';
 let activeZoomTeamId = null;
 let serverAvailable = false;
 let wsConnection = null;
 let wsReconnectTimer = null;
 let isFetchingRemote = false;
+let appBooted = false;
 
 const autoSaveTimers = new Map();
 const dirtyTeamIds = new Set();
@@ -165,9 +200,13 @@ const DEFAULT_ROLES = [
 ];
 
 function getActiveScriptUrl() {
-  const saved = (localStorage.getItem(STORAGE_KEY_SCRIPT_URL) || '').trim();
-  if (saved.startsWith('https://script.google.com/')) {
-    return saved;
+  try {
+    const saved = (localStorage.getItem(STORAGE_KEY_SCRIPT_URL) || '').trim();
+    if (saved.startsWith('https://script.google.com/')) {
+      return saved;
+    }
+  } catch {
+    // Ignore storage access errors
   }
   if (DEFAULT_APPS_SCRIPT_URL.startsWith('https://script.google.com/')) {
     return DEFAULT_APPS_SCRIPT_URL.trim();
@@ -175,12 +214,15 @@ function getActiveScriptUrl() {
   return '';
 }
 
-document.addEventListener('DOMContentLoaded', async () => {
-  applyUrlParameters();
+async function bootApp() {
+  if (appBooted) return;
+  appBooted = true;
+
   initLocalFallbackData();
   renderInputGrid();
   renderTeacherBoardGrid();
   updateStats();
+  applyUrlParameters();
   setupEventListeners();
 
   await fetchLatestFromServer(false);
@@ -188,7 +230,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     connectWebSocket();
   }
   startBackgroundSyncLoop();
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootApp);
+} else {
+  bootApp();
+}
 
 function applyUrlParameters() {
   try {
@@ -207,33 +255,17 @@ function applyUrlParameters() {
 }
 
 function initLocalFallbackData() {
-  const saved = localStorage.getItem(STORAGE_KEY_TEAMS);
-  if (saved) {
-    try {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_TEAMS);
+    if (saved) {
       const parsed = JSON.parse(saved);
-      if (Array.isArray(parsed) && parsed.length === DEFAULT_TEAMS_COUNT) {
-        teamsData = parsed;
-        return;
-      }
-    } catch {
-      // Ignore corrupt cache
+      teamsData = normalizeTeamsList(parsed);
+      return;
     }
+  } catch {
+    // Ignore corrupt cache
   }
   teamsData = generateDefaultTeams();
-}
-
-function generateDefaultTeams() {
-  const list = [];
-  for (let i = 1; i <= DEFAULT_TEAMS_COUNT; i++) {
-    list.push({
-      id: i,
-      teamNumber: `${i}모둠`,
-      countryName: '',
-      sentence: '',
-      updatedAt: null
-    });
-  }
-  return list;
 }
 
 function saveToLocalStorage() {
@@ -266,7 +298,6 @@ function setSheetDiagnostic(type, message) {
 async function fetchFromAppsScriptSmart(scriptUrl) {
   if (!scriptUrl) return { ok: false, errorCode: 'EMPTY_URL' };
 
-  // When running on AI Studio / Express server, route via /api/sheet-proxy to prevent iframe CORS fetch errors and inspect 302 redirects
   if (!IS_STATIC_HOST) {
     try {
       const proxyRes = await fetch(`/api/sheet-proxy?url=${encodeURIComponent(scriptUrl)}`, {
@@ -282,7 +313,6 @@ async function fetchFromAppsScriptSmart(scriptUrl) {
     }
   }
 
-  // Direct browser fetch (GitHub Pages: credentials 'omit' avoids Google multi-account login redirect bug!)
   try {
     const sep = scriptUrl.includes('?') ? '&' : '?';
     const res = await fetch(`${scriptUrl}${sep}t=${Date.now()}`, {
@@ -301,7 +331,6 @@ async function fetchFromAppsScriptSmart(scriptUrl) {
     }
     return { ok: false, errorCode: 'INVALID_JSON', message: '시트 데이터 형식이 올바르지 않습니다.' };
   } catch {
-    // Try JSONP fallback in case browser blocked cross-origin redirect headers
     const jsonpResult = await fetchViaJsonpFallback(scriptUrl);
     if (jsonpResult.ok) return jsonpResult;
 
@@ -363,7 +392,6 @@ async function postToAppsScriptSmart(payload) {
   const scriptUrl = getActiveScriptUrl();
   if (!scriptUrl) return { ok: false };
 
-  // Route via server proxy when running on AI Studio / Express
   if (!IS_STATIC_HOST) {
     try {
       const proxyRes = await fetch('/api/sheet-proxy', {
@@ -383,7 +411,6 @@ async function postToAppsScriptSmart(payload) {
     }
   }
 
-  // Direct browser POST on GitHub Pages (credentials: 'omit' + text/plain avoids CORS preflight & multi-account cookie issues)
   try {
     const res = await fetch(scriptUrl, {
       method: 'POST',
@@ -405,7 +432,6 @@ async function postToAppsScriptSmart(payload) {
       return { ok: true };
     }
   } catch {
-    // Safari / strict browser 302 POST redirect fallback: send opaque POST (which still executes doPost on Google Sheet!) then re-read
     try {
       await fetch(scriptUrl, {
         method: 'POST',
@@ -553,13 +579,16 @@ function applyRemoteSingleTeam(remoteTeam) {
   const localTeam = teamsData.find(t => t.id === id);
   if (!localTeam || isUserActivelyEditingTeam(id)) return;
 
-  const changed =
-    localTeam.countryName !== (remoteTeam.countryName || '') ||
-    localTeam.sentence !== (remoteTeam.sentence || '');
+  const newCountry = String(remoteTeam.countryName || '');
+  const newSentence = String(remoteTeam.sentence || '');
 
-  localTeam.countryName = remoteTeam.countryName || '';
-  localTeam.sentence = remoteTeam.sentence || '';
-  localTeam.updatedAt = remoteTeam.updatedAt || null;
+  const changed =
+    localTeam.countryName !== newCountry ||
+    localTeam.sentence !== newSentence;
+
+  localTeam.countryName = newCountry;
+  localTeam.sentence = newSentence;
+  localTeam.updatedAt = remoteTeam.updatedAt ? String(remoteTeam.updatedAt) : null;
 
   if (changed) {
     patchSingleInputCardDom(localTeam);
@@ -572,11 +601,12 @@ function applyRemoteSingleTeam(remoteTeam) {
 }
 
 function applyRemoteTeamsList(remoteTeams) {
+  if (!Array.isArray(remoteTeams)) return;
   let anyBoardChange = false;
 
   for (let i = 0; i < DEFAULT_TEAMS_COUNT; i++) {
     const id = i + 1;
-    const remote = remoteTeams.find(r => Number(r.id) === id) || remoteTeams[i];
+    const remote = remoteTeams.find(r => r && Number(r.id) === id) || remoteTeams[i];
     if (!remote || isUserActivelyEditingTeam(id)) continue;
 
     const local = teamsData.find(t => t.id === id);
@@ -588,7 +618,7 @@ function applyRemoteTeamsList(remoteTeams) {
     if (local.countryName !== newCountry || local.sentence !== newSentence) {
       local.countryName = newCountry;
       local.sentence = newSentence;
-      local.updatedAt = remote.updatedAt || null;
+      local.updatedAt = remote.updatedAt ? String(remote.updatedAt) : null;
       patchSingleInputCardDom(local);
       anyBoardChange = true;
 
@@ -692,19 +722,26 @@ function renderInputGrid() {
   const container = document.getElementById('inputGrid');
   if (!container) return;
 
+  if (!Array.isArray(teamsData) || teamsData.length !== DEFAULT_TEAMS_COUNT) {
+    teamsData = normalizeTeamsList(teamsData);
+  }
+
   container.innerHTML = teamsData.map((team, idx) => {
     const colorIndex = (idx % 6) + 1;
-    const hasContent = team.sentence.trim().length > 0 || team.countryName.trim().length > 0;
-    const isCompleted = team.sentence.trim().length > 0;
+    const countryName = String(team.countryName || '');
+    const sentence = String(team.sentence || '');
+    const teamNumber = String(team.teamNumber || `${idx + 1}모둠`);
+    const hasContent = sentence.trim().length > 0 || countryName.trim().length > 0;
+    const isCompleted = sentence.trim().length > 0;
     const statusText = isCompleted ? '공유 완료 ✈️' : (hasContent ? '나라 입력됨 🌍' : '작성 대기 ✏️');
     const statusClass = isCompleted ? 'status-completed' : 'status-empty';
-    const displayName = team.countryName ? team.countryName : '나라명 미입력';
+    const displayName = countryName ? countryName : '나라명 미입력';
 
     return `
       <div class="team-card" data-color="${colorIndex}" id="input-card-${team.id}">
         <div class="card-header">
           <div class="team-title-wrap">
-            <span class="team-number-badge">${team.teamNumber}</span>
+            <span class="team-number-badge">${escapeHtml(teamNumber)}</span>
             <span class="team-country-badge" id="badge-country-${team.id}">${escapeHtml(displayName)}</span>
           </div>
           <span class="team-status-tag ${statusClass}" id="status-tag-${team.id}">${statusText}</span>
@@ -717,7 +754,7 @@ function renderInputGrid() {
             id="country-${team.id}" 
             class="input-country" 
             placeholder="예: 🇰🇷 대한민국, 🇪🇬 이집트 등" 
-            value="${escapeHtml(team.countryName)}"
+            value="${escapeHtml(countryName)}"
             oninput="handleCountryInput(${team.id}, this.value)"
             onblur="handleInputBlur(${team.id})"
           />
@@ -732,7 +769,7 @@ function renderInputGrid() {
             oninput="handleSentenceInput(${team.id}, this.value)"
             onblur="handleInputBlur(${team.id})"
             onkeydown="if((event.ctrlKey || event.metaKey) && event.key === 'Enter') manualSaveTeam(${team.id})"
-          >${escapeHtml(team.sentence)}</textarea>
+          >${escapeHtml(sentence)}</textarea>
         </div>
 
         <div class="card-actions">
@@ -752,15 +789,17 @@ function patchSingleInputCardDom(team) {
   const countryInput = document.getElementById(`country-${team.id}`);
   const sentenceInput = document.getElementById(`sentence-${team.id}`);
   const badge = document.getElementById(`badge-country-${team.id}`);
+  const countryName = String(team.countryName || '');
+  const sentence = String(team.sentence || '');
 
   if (countryInput && document.activeElement !== countryInput) {
-    countryInput.value = team.countryName;
+    countryInput.value = countryName;
   }
   if (sentenceInput && document.activeElement !== sentenceInput) {
-    sentenceInput.value = team.sentence;
+    sentenceInput.value = sentence;
   }
   if (badge) {
-    badge.textContent = team.countryName ? team.countryName : '나라명 미입력';
+    badge.textContent = countryName ? countryName : '나라명 미입력';
   }
   setCardStatusUI(team.id, 'saved');
 }
@@ -796,8 +835,8 @@ function setCardStatusUI(teamId, state) {
     return;
   }
 
-  const isCompleted = team.sentence.trim().length > 0;
-  const hasCountry = team.countryName.trim().length > 0;
+  const isCompleted = String(team.sentence || '').trim().length > 0;
+  const hasCountry = String(team.countryName || '').trim().length > 0;
   if (statusTag) {
     if (isCompleted) {
       statusTag.textContent = '공유 완료 ✈️';
@@ -820,10 +859,17 @@ function renderTeacherBoardGrid() {
   const container = document.getElementById('boardGrid');
   if (!container) return;
 
+  if (!Array.isArray(teamsData) || teamsData.length !== DEFAULT_TEAMS_COUNT) {
+    teamsData = normalizeTeamsList(teamsData);
+  }
+
   container.innerHTML = teamsData.map((team, idx) => {
     const colorIndex = (idx % 6) + 1;
-    const isCompleted = team.sentence.trim().length > 0;
-    const countryLabel = team.countryName.trim() ? team.countryName : '(나라 미정)';
+    const countryName = String(team.countryName || '');
+    const sentence = String(team.sentence || '');
+    const teamNumber = String(team.teamNumber || `${idx + 1}모둠`);
+    const isCompleted = sentence.trim().length > 0;
+    const countryLabel = countryName.trim() ? countryName : '(나라 미정)';
     const statusText = isCompleted ? '공유 완료' : '작성 대기';
     const statusClass = isCompleted ? 'status-completed' : 'status-empty';
 
@@ -834,12 +880,12 @@ function renderTeacherBoardGrid() {
         onclick="openZoomModal(${team.id})"
         tabindex="0"
         role="button"
-        aria-label="${team.teamNumber} ${escapeHtml(countryLabel)} 내용 크게 보기"
+        aria-label="${escapeHtml(teamNumber)} ${escapeHtml(countryLabel)} 내용 크게 보기"
         onkeydown="if(event.key === 'Enter') openZoomModal(${team.id})"
       >
         <div class="card-header">
           <div class="team-title-wrap">
-            <span class="team-number-badge">${team.teamNumber}</span>
+            <span class="team-number-badge">${escapeHtml(teamNumber)}</span>
             <span class="team-country-badge">${escapeHtml(countryLabel)}</span>
           </div>
           <span class="team-status-tag ${statusClass}">${statusText}</span>
@@ -847,7 +893,7 @@ function renderTeacherBoardGrid() {
 
         <div class="board-sentence-area">
           ${isCompleted 
-            ? `<p class="board-sentence-text">“${escapeHtml(team.sentence)}”</p>`
+            ? `<p class="board-sentence-text">“${escapeHtml(sentence)}”</p>`
             : `<p class="board-sentence-empty">아직 일반화된 문장이 작성되지 않았습니다.</p>`
           }
         </div>
@@ -872,7 +918,7 @@ function handleCountryInput(id, val) {
   const team = teamsData.find(t => t.id === id);
   if (!team) return;
 
-  team.countryName = val.trim();
+  team.countryName = String(val || '').trim();
   team.updatedAt = new Date().toISOString();
 
   const badge = document.getElementById(`badge-country-${id}`);
@@ -889,7 +935,7 @@ function handleSentenceInput(id, val) {
   const team = teamsData.find(t => t.id === id);
   if (!team) return;
 
-  team.sentence = val.trim();
+  team.sentence = String(val || '').trim();
   team.updatedAt = new Date().toISOString();
 
   saveToLocalStorage();
@@ -1019,7 +1065,7 @@ function resetAllTeams() {
 }
 
 function updateStats() {
-  const completedCount = teamsData.filter(t => t.sentence.trim().length > 0).length;
+  const completedCount = teamsData.filter(t => String(t.sentence || '').trim().length > 0).length;
   const countEl = document.getElementById('completedCount');
   if (countEl) {
     countEl.textContent = `${completedCount} / ${DEFAULT_TEAMS_COUNT}`;
@@ -1059,7 +1105,7 @@ function setViewMode(mode, silent) {
     if (btnInput) btnInput.classList.add('active');
     if (btnTeacher) btnTeacher.classList.remove('active');
     if (noticeText) {
-      noticeText.innerHTML = '<span>✨ <strong>14개 모둠 탐구 카드</strong> 중 우리 모둠 칸에 나라 이름과 일반화된 문장을 작성한 뒤 <strong>[💾 전광판에 저장]</strong>을 눌러 주세요!</span>';
+      noticeText.innerHTML = '<span>✨ <strong>14개 모둠 탐구 카드</strong> 중 우리 모둠 칸에 나라 이름과 일반화된 문장을 작성한 뒤 <strong>[💾 전광판에 저장]</strong> 버튼을 꼭 눌러 주세요!</span>';
     }
     if (noticeHint) {
       noticeHint.textContent = '저장 즉시 교사 종합 전광판에 실시간으로 반영됩니다.';
@@ -1122,16 +1168,19 @@ function updateZoomModalContent(teamId) {
   const btnPrev = document.getElementById('btnZoomPrev');
   const btnNext = document.getElementById('btnZoomNext');
 
+  const countryName = String(team.countryName || '');
+  const sentence = String(team.sentence || '');
+
   if (badgeEl) badgeEl.textContent = team.teamNumber;
   if (titleEl) {
-    titleEl.textContent = team.countryName ? `🌍 ${team.countryName}` : '🌍 (탐구 국가 미입력)';
+    titleEl.textContent = countryName ? `🌍 ${countryName}` : '🌍 (탐구 국가 미입력)';
   }
 
   if (bodyEl) {
-    if (team.sentence.trim().length > 0) {
+    if (sentence.trim().length > 0) {
       bodyEl.innerHTML = `
         <span class="quote-mark">“</span>
-        <div class="zoom-sentence">${escapeHtml(team.sentence)}</div>
+        <div class="zoom-sentence">${escapeHtml(sentence)}</div>
         <span class="quote-mark">”</span>
       `;
     } else {
@@ -1177,12 +1226,12 @@ function openBatchNamesModal() {
 
   container.innerHTML = teamsData.map(team => `
     <div class="batch-row">
-      <span class="batch-label">${team.teamNumber}</span>
+      <span class="batch-label">${escapeHtml(team.teamNumber)}</span>
       <input 
         type="text" 
         id="batch-country-${team.id}" 
         class="batch-input" 
-        value="${escapeHtml(team.countryName)}" 
+        value="${escapeHtml(String(team.countryName || ''))}" 
         placeholder="나라 이름 입력"
       />
     </div>
@@ -1297,7 +1346,11 @@ function closeSheetModal() {
 
 async function saveSheetUrlToSharedConfig() {
   const url = document.getElementById('sheetUrlInput').value.trim();
-  localStorage.setItem(STORAGE_KEY_SCRIPT_URL, url);
+  try {
+    localStorage.setItem(STORAGE_KEY_SCRIPT_URL, url);
+  } catch {
+    // Ignore
+  }
   if (!IS_STATIC_HOST) {
     try {
       await fetch('/api/config', {
@@ -1329,17 +1382,7 @@ async function executeSheetLoad() {
     const result = await fetchFromAppsScriptSmart(scriptUrl);
 
     if (result.ok && Array.isArray(result.teams)) {
-      teamsData = teamsData.map((def, idx) => {
-        const item = result.teams.find(r => Number(r.id) === def.id) || result.teams[idx] || {};
-        return {
-          id: def.id,
-          teamNumber: def.teamNumber,
-          countryName: String(item.countryName || ''),
-          sentence: String(item.sentence || ''),
-          updatedAt: item.updatedAt || new Date().toISOString()
-        };
-      });
-
+      teamsData = normalizeTeamsList(result.teams);
       saveToLocalStorage();
       renderApp();
       setSheetDiagnostic('ok', '✅ 구글 시트 실시간 연결 성공! 이제 누구나 입력하면 전광판에 동시에 반영됩니다.');
@@ -1416,16 +1459,7 @@ function importDataFromJson() {
       try {
         const parsed = JSON.parse(event.target.result);
         if (Array.isArray(parsed)) {
-          teamsData = teamsData.map((def, idx) => {
-            const item = parsed.find(r => Number(r.id) === def.id) || parsed[idx] || {};
-            return {
-              id: def.id,
-              teamNumber: def.teamNumber,
-              countryName: String(item.countryName || ''),
-              sentence: String(item.sentence || ''),
-              updatedAt: item.updatedAt || new Date().toISOString()
-            };
-          });
+          teamsData = normalizeTeamsList(parsed);
 
           await postToAppsScriptSmart({ action: 'replaceAll', teams: teamsData });
           if (!IS_STATIC_HOST) {
